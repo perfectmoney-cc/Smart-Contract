@@ -2,234 +2,168 @@
 pragma solidity ^0.8.30;
 
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
 interface IERC20 {
     function transfer(address recipient, uint256 amount) external returns (bool);
-    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
 }
 
-/**
- * @dev Simple Ownable implementation
- */
-abstract contract Ownable {
-    address private _owner;
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
-
-    constructor() {
-        _owner = msg.sender;
-        emit OwnershipTransferred(address(0), msg.sender);
-    }
-
-    function owner() public view returns (address) {
-        return _owner;
-    }
-
-    modifier onlyOwner() {
-        require(msg.sender == _owner, "Ownable: caller is not the owner");
-        _;
-    }
-
-    function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "Ownable: new owner is zero");
-        emit OwnershipTransferred(_owner, newOwner);
-        _owner = newOwner;
-    }
-}
-
-/**
- * @title PM Token Airdrop Contract (SAFETY-ENHANCED)
- */
+/// @title PMAirdrop - Airdrop with tasks completion before claim, fees charged once at final claim
+/// @notice Users visit tasks (no tokens given per task), then claim all tokens once after finishing all tasks.
+/// @dev Uses ReentrancyGuard to protect ETH transfer functions. Fees paid once on final claim.
 contract PMAirdrop is Ownable, ReentrancyGuard {
-    IERC20 public pmToken;
+    IERC20 public immutable pmToken;
 
-    bytes32 public merkleRoot;
-    uint256 public totalClaimed;
+    uint256 public constant TOTAL_TASKS = 9;  // fixed total tasks
+
     uint256 public maxClaimable;
+    uint256 public totalClaimed;
 
-    uint256 public startTime;
-    uint256 public endTime;
-    bool public isActive;
+    uint256 public claimFeeBNB = 0.0005 ether;  
+    uint256 public networkFeeBNB = 0.0005 ether;
 
-    mapping(address => bool) public hasClaimed;
-    mapping(address => uint256) public claimedAmount;
+    uint256 public totalReward; // total reward after completing all tasks
 
-    // Task system
-    mapping(address => mapping(uint256 => bool)) public taskCompleted;
-    mapping(uint256 => uint256) public taskRewards;
-    uint256 public totalTasks;
+    address public feeCollector;
 
-    event AirdropClaimed(address indexed user, uint256 amount);
-    event TaskCompleted(address indexed user, uint256 taskId, uint256 reward);
-    event MerkleRootUpdated(bytes32 newRoot);
-    event AirdropStarted(uint256 start, uint256 end);
-    event AirdropEnded(uint256 endTime);
-    event TokensWithdrawn(uint256 amount);
+    // User => taskId => visited flag
+    mapping(address => mapping(uint256 => bool)) private _taskVisited;
 
-    constructor(address _pmToken) {
-        require(_pmToken != address(0), "Token address zero");
-        pmToken = IERC20(_pmToken);
-        isActive = false;
+    // User => claimed flag
+    mapping(address => bool) private _hasClaimed;
+
+    // EVENTS
+    event TaskVisited(address indexed user, uint256 indexed taskId);
+    event RewardClaimed(address indexed user, uint256 amount);
+    event FeesPaid(address indexed user, uint256 amount);
+    event FeesUpdated(uint256 claimFeeBNB, uint256 networkFeeBNB);
+    event MaxClaimableUpdated(uint256 maxClaimable);
+    event TotalRewardUpdated(uint256 totalReward);
+    event FeeCollectorUpdated(address indexed feeCollector);
+
+    // ERRORS for gas optimization & clarity
+    error InvalidTaskId(uint256 taskId);
+    error TaskAlreadyVisited(uint256 taskId);
+    error AlreadyClaimed();
+    error NotAllTasksCompleted();
+    error InsufficientFee(uint256 required, uint256 sent);
+    error MaxClaimableExceeded(uint256 totalClaimed, uint256 maxClaimable);
+    error TransferFailed();
+
+    constructor(address _pmToken, uint256 _totalReward) Ownable(msg.sender) {
+    require(_pmToken != address(0), "Zero token address");
+    require(_totalReward > 0, "Total reward must be > 0");
+
+    pmToken = IERC20(_pmToken);
+    totalReward = _totalReward;
+    feeCollector = msg.sender;
+}
+
+
+    /// @notice Mark a specific task as visited/completed (no tokens transferred)
+    /// @param _taskId Task ID between 0 and TOTAL_TASKS-1
+    function visitTask(uint256 _taskId) external {
+        if (_taskId >= TOTAL_TASKS) revert InvalidTaskId(_taskId);
+        if (_hasClaimed[msg.sender]) revert AlreadyClaimed();
+        if (_taskVisited[msg.sender][_taskId]) revert TaskAlreadyVisited(_taskId);
+
+        _taskVisited[msg.sender][_taskId] = true;
+        emit TaskVisited(msg.sender, _taskId);
     }
 
-    // -----------------------------------------------------
+    /// @notice Claim total reward after all tasks visited, paying fees once
+    /// @dev Uses nonReentrant modifier for safety
+    function claimReward() external payable nonReentrant {
+        if (_hasClaimed[msg.sender]) revert AlreadyClaimed();
+        if (totalClaimed + totalReward > maxClaimable) revert MaxClaimableExceeded(totalClaimed, maxClaimable);
+
+        // Check all tasks visited
+        for (uint256 i = 0; i < TOTAL_TASKS; i++) {
+            if (!_taskVisited[msg.sender][i]) revert NotAllTasksCompleted();
+        }
+
+        uint256 totalFee = claimFeeBNB + networkFeeBNB;
+        if (msg.value < totalFee) revert InsufficientFee(totalFee, msg.value);
+
+        // Mark claimed BEFORE external calls (checks-effects-interactions pattern)
+        _hasClaimed[msg.sender] = true;
+        totalClaimed += totalReward;
+
+        // Transfer tokens to user
+        bool sent = pmToken.transfer(msg.sender, totalReward);
+        if (!sent) revert TransferFailed();
+
+        // Transfer fees to feeCollector
+        (bool feeSent, ) = payable(feeCollector).call{value: totalFee}("");
+        require(feeSent, "Fee transfer failed");
+
+        // Refund extra BNB
+        if (msg.value > totalFee) {
+            (bool refundSent, ) = payable(msg.sender).call{value: msg.value - totalFee}("");
+            require(refundSent, "Refund failed");
+        }
+
+        emit RewardClaimed(msg.sender, totalReward);
+        emit FeesPaid(msg.sender, totalFee);
+    }
+
+    /// @notice Returns whether the user has visited a specific task
+    /// @param user User address to query
+    /// @param taskId Task ID between 0 and TOTAL_TASKS-1
+    function hasVisitedTask(address user, uint256 taskId) external view returns (bool) {
+        if (taskId >= TOTAL_TASKS) return false;
+        return _taskVisited[user][taskId];
+    }
+
+    /// @notice Returns whether the user has claimed the reward
+    /// @param user User address
+    function hasClaimedReward(address user) external view returns (bool) {
+        return _hasClaimed[user];
+    }
+
     // ADMIN FUNCTIONS
-    // -----------------------------------------------------
 
-    /**
-     * @notice Start airdrop AFTER prefunding
-     */
-    function startAirdrop(uint256 duration, uint256 _maxClaimable)
-        external
-        onlyOwner
-    {
-        require(!isActive, "Airdrop already active");
-        require(_maxClaimable > 0, "Zero max");
-
-        // Prefunding check
-        require(
-            pmToken.balanceOf(address(this)) >= _maxClaimable,
-            "Not enough tokens in contract"
-        );
-
-        startTime = block.timestamp;
-        endTime = block.timestamp + duration;
-        maxClaimable = _maxClaimable;
-
-        isActive = true;
-        emit AirdropStarted(startTime, endTime);
+    /// @notice Set flat claim fee (in wei)
+    function setClaimFeeBNB(uint256 _fee) external onlyOwner {
+        claimFeeBNB = _fee;
+        emit FeesUpdated(claimFeeBNB, networkFeeBNB);
     }
 
-    function endAirdrop() external onlyOwner {
-        isActive = false;
-        emit AirdropEnded(block.timestamp);
+    /// @notice Set flat network fee (in wei)
+    function setNetworkFeeBNB(uint256 _fee) external onlyOwner {
+        networkFeeBNB = _fee;
+        emit FeesUpdated(claimFeeBNB, networkFeeBNB);
     }
 
-    function setMerkleRoot(bytes32 _root) external onlyOwner {
-        merkleRoot = _root;
-        emit MerkleRootUpdated(_root);
+    /// @notice Set max claimable tokens in total
+    function setMaxClaimable(uint256 _max) external onlyOwner {
+        maxClaimable = _max;
+        emit MaxClaimableUpdated(_max);
     }
 
-    function setTaskReward(uint256 taskId, uint256 reward) external onlyOwner {
-        taskRewards[taskId] = reward;
-        if (taskId >= totalTasks) {
-            totalTasks = taskId + 1;
-        }
+    /// @notice Set total reward amount for completing all tasks
+    function setTotalReward(uint256 _totalReward) external onlyOwner {
+        totalReward = _totalReward;
+        emit TotalRewardUpdated(_totalReward);
     }
 
-    // -----------------------------------------------------
-    // CLAIM FUNCTIONS
-    // -----------------------------------------------------
-
-    /**
-     * @notice Claim airdrop using Merkle proof
-     * Merkle leaf = keccak256(abi.encode(msg.sender, amount))
-     */
-    function claim(uint256 amount, bytes32[] calldata proof)
-        external
-        nonReentrant
-    {
-        require(isActive, "Airdrop not active");
-        require(block.timestamp >= startTime && block.timestamp <= endTime, "Not in airdrop window");
-        require(!hasClaimed[msg.sender], "Already claimed");
-
-        // Verify merkle proof
-        bytes32 leaf = keccak256(abi.encode(msg.sender, amount));
-        require(verify(proof, merkleRoot, leaf), "Invalid proof");
-
-        require(totalClaimed + amount <= maxClaimable, "Max exceeded");
-
-        hasClaimed[msg.sender] = true;
-        claimedAmount[msg.sender] += amount;
-        totalClaimed += amount;
-
-        require(pmToken.transfer(msg.sender, amount), "Transfer failed");
-
-        emit AirdropClaimed(msg.sender, amount);
+    /// @notice Set fee collector address
+    function setFeeCollector(address _collector) external onlyOwner {
+        require(_collector != address(0), "Zero fee collector");
+        feeCollector = _collector;
+        emit FeeCollectorUpdated(_collector);
     }
 
-    /**
-     * @notice Claim task reward
-     */
-    function claimTask(uint256 taskId)
-        external
-        nonReentrant
-    {
-        require(isActive, "Airdrop not active");
-        require(!taskCompleted[msg.sender][taskId], "Task done");
-
-        uint256 reward = taskRewards[taskId];
-        require(reward > 0, "Invalid task");
-
-        require(totalClaimed + reward <= maxClaimable, "Max exceeded");
-
-        taskCompleted[msg.sender][taskId] = true;
-        claimedAmount[msg.sender] += reward;
-        totalClaimed += reward;
-
-        require(pmToken.transfer(msg.sender, reward), "Transfer failed");
-
-        emit TaskCompleted(msg.sender, taskId, reward);
+    /// @notice Withdraw leftover tokens (emergency use)
+    /// @param amount Amount to withdraw
+    function withdrawTokens(uint256 amount) external onlyOwner {
+        bool sent = pmToken.transfer(msg.sender, amount);
+        require(sent, "Token withdraw failed");
     }
 
-    // -----------------------------------------------------
-    // WITHDRAW (SAFE)
-    // -----------------------------------------------------
+    /// @notice Receive function to accept BNB fees
+    receive() external payable {}
 
-    /**
-     * @notice Withdraw leftover tokens only AFTER airdrop ends
-     */
-    function withdrawTokens(uint256 amount)
-        external
-        onlyOwner
-        nonReentrant
-    {
-        require(!isActive, "End airdrop first");
-        require(block.timestamp > endTime, "Not ended");
-        require(pmToken.transfer(owner(), amount), "Withdraw fail");
-        emit TokensWithdrawn(amount);
-    }
-
-    // -----------------------------------------------------
-    // INTERNAL MERKLE FUNCTION
-    // -----------------------------------------------------
-
-    function verify(
-        bytes32[] calldata proof,
-        bytes32 root,
-        bytes32 leaf
-    ) internal pure returns (bool) {
-        bytes32 hash = leaf;
-        for (uint256 i = 0; i < proof.length; i++) {
-            bytes32 p = proof[i];
-            hash = (hash <= p)
-                ? keccak256(abi.encodePacked(hash, p))
-                : keccak256(abi.encodePacked(p, hash));
-        }
-        return hash == root;
-    }
-
-    // -----------------------------------------------------
-    // VIEW FUNCTIONS
-    // -----------------------------------------------------
-
-    function getUserTasks(address user) public view returns (uint256[] memory) {
-        uint256 count = 0;
-
-        for (uint256 i = 0; i < totalTasks; i++) {
-            if (taskCompleted[user][i]) count++;
-        }
-
-        uint256[] memory result = new uint256[](count);
-        uint256 index = 0;
-
-        for (uint256 i = 0; i < totalTasks; i++) {
-            if (taskCompleted[user][i]) {
-                result[index] = i;
-                index++;
-            }
-        }
-
-        return result;
-    }
+    /// @notice Fallback function
+    fallback() external payable {}
 }
