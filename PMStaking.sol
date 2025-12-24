@@ -271,7 +271,6 @@ contract PMStaking is Ownable, ReentrancyGuard, Pausable {
     }
 
     function _claimReward(address user, uint256 id, uint256 reward) internal {
-        syncRewardPool();
         require(rewardPool >= reward, "reward pool empty");
 
         Stake storage s = userStakes[user][id];
@@ -331,6 +330,21 @@ contract PMStaking is Ownable, ReentrancyGuard, Pausable {
         return userStakes[user];
     }
 
+    function getPlanInfo(uint256 planId)
+        external
+        view
+        returns (
+            uint256 duration,
+            uint256 apyRate,
+            uint256 minStake,
+            uint256 maxStake,
+            bool isActive
+        )
+    {
+        StakingPlan storage p = stakingPlans[planId];
+        return (p.duration, p.apyRate, p.minStake, p.maxStake, p.isActive);
+    }
+
     function getGlobalStats()
         external
         view
@@ -344,4 +358,3 @@ contract PMStaking is Ownable, ReentrancyGuard, Pausable {
         return (totalStakedGlobal, totalRewardsDistributed, rewardPool, planCount);
     }
 }
-

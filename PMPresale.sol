@@ -41,7 +41,7 @@ abstract contract ReentrancyGuard {
 /**
  * @title Multi-Round Token Presale (Seed → Private → Public)
  */
-contract PMPresale is Ownable, ReentrancyGuard {
+contract MultiRoundPresale is Ownable, ReentrancyGuard {
     IERC20 public immutable token;
     uint8  public immutable tokenDecimals;
 
@@ -162,5 +162,41 @@ contract PMPresale is Ownable, ReentrancyGuard {
 
     function purchasedAmount(uint8 r, address user) external view returns(uint256) {
         return rounds[r].purchased[user];
+    }
+
+    function isWhitelisted(uint8 r, address user) external view returns(bool) {
+        return rounds[r].whitelist[user];
+    }
+
+    function getRoundInfo(uint8 r) external view returns(
+        uint256 price,
+        uint256 supply,
+        uint256 sold,
+        uint256 start,
+        uint256 end,
+        uint256 minBuy,
+        uint256 maxBuyTokens,
+        bool whitelistEnabled
+    ) {
+        Round storage rd = rounds[r];
+        return (rd.price, rd.supply, rd.sold, rd.start, rd.end, rd.minBuy, rd.maxBuyTokens, rd.whitelistEnabled);
+    }
+
+    function getTotalSold() external view returns(uint256) {
+        return rounds[0].sold + rounds[1].sold + rounds[2].sold;
+    }
+
+    function getTotalSupply() external view returns(uint256) {
+        return rounds[0].supply + rounds[1].supply + rounds[2].supply;
+    }
+
+    function getActiveRound() external view returns(int8) {
+        if (presaleEnded) return -1;
+        for (uint8 i = 0; i < 3; i++) {
+            if (block.timestamp >= rounds[i].start && block.timestamp <= rounds[i].end) {
+                return int8(i);
+            }
+        }
+        return -1;
     }
 }
